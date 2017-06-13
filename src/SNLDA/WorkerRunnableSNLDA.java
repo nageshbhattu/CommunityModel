@@ -7,6 +7,7 @@
 
 package SNLDA;
 
+import CorpusReader.Document;
 import java.util.Arrays;
 import java.util.ArrayList;
 
@@ -28,7 +29,7 @@ public class WorkerRunnableSNLDA implements Runnable {
 	
 	boolean isFinished = true;
 
-	ArrayList<TopicAssignment> data;
+	InstanceList data;
 	int startDoc, numDocs;
 
 	protected int numTopics; // Number of topics to be fit
@@ -39,6 +40,8 @@ public class WorkerRunnableSNLDA implements Runnable {
 	protected int topicBits;
 
 	protected int numTypes;
+        protected int numCommunities;
+        protected int numUsers;
 
 	protected double[] alpha;	 // Dirichlet(alpha,alpha,...) is the distribution over topics
 	protected double alphaSum;
@@ -48,8 +51,8 @@ public class WorkerRunnableSNLDA implements Runnable {
 	
 	protected double smoothingOnlyMass = 0.0;
 	protected double[] cachedCoefficients;
-
-	protected int[][] typeTopicCounts; // indexed by <feature index, topic index>
+        
+        protected int[][] typeTopicCounts; // indexed by <feature index, topic index>
 	protected int[] tokensPerTopic; // indexed by <topic index>
 
 	// for dirichlet estimation
@@ -60,13 +63,23 @@ public class WorkerRunnableSNLDA implements Runnable {
 	boolean shouldBuildLocalCounts = true;
 	
 	protected Randoms random;
+        
+        protected int[][] rUserCommunityCounts; // indexed by <user index, community index>
+        protected int[][] userCommunityCounts; // indexed by <user index, community index>
+        
+        protected int[][] communityTopicCounts; // indexed by <community index, topic index>
+	private final int[] tokensPerCommunity; // size numCommunities;
 	
 	public WorkerRunnableSNLDA (int numTopics,
 						   double[] alpha, double alphaSum,
 						   double beta, Randoms random,
-						   ArrayList<TopicAssignment> data,
-						   int[][] typeTopicCounts, 
+						   InstanceList data,
+						   int[][] typeTopicCounts,
+                                                   int[][] communityTopicCounts,
 						   int[] tokensPerTopic,
+                                                   int[] tokensPerCommunity,
+                                                   int[][] userCommunityCounts,
+                                                   int[][] rUserCommunityCounts,
 						   int startDoc, int numDocs) {
 
 		this.data = data;
@@ -86,8 +99,12 @@ public class WorkerRunnableSNLDA implements Runnable {
 		}
 
 		this.typeTopicCounts = typeTopicCounts;
+                this.communityTopicCounts = communityTopicCounts;
 		this.tokensPerTopic = tokensPerTopic;
-		
+		this.tokensPerCommunity  = tokensPerCommunity;
+                this.userCommunityCounts = userCommunityCounts;
+                this.rUserCommunityCounts = rUserCommunityCounts;
+                
 		this.alphaSum = alphaSum;
 		this.alpha = alpha;
 		this.beta = beta;
@@ -143,96 +160,100 @@ public class WorkerRunnableSNLDA implements Runnable {
 	public void buildLocalTypeTopicCounts () {
 
 		// Clear the topic totals
-		Arrays.fill(tokensPerTopic, 0);
+            Arrays.fill(tokensPerTopic, 0);
 
-		// Clear the type/topic counts, only 
-		//  looking at the entries before the first 0 entry.
+            // Clear the type/topic counts, only 
+            //  looking at the entries before the first 0 entry.
 
-		for (int type = 0; type < typeTopicCounts.length; type++) {
+            for (int type = 0; type < typeTopicCounts.length; type++) {
 
-			int[] topicCounts = typeTopicCounts[type];
-			
-			int position = 0;
-			while (position < topicCounts.length && 
-				   topicCounts[position] > 0) {
-				topicCounts[position] = 0;
-				position++;
-			}
-		}
+                int[] topicCounts = typeTopicCounts[type];
 
-        for (int doc = startDoc;
-			 doc < data.size() && doc < startDoc + numDocs;
-             doc++) {
+                int position = 0;
+                while (position < topicCounts.length && 
+                           topicCounts[position] > 0) {
+                        topicCounts[position] = 0;
+                        position++;
+                }
+            }
+            for(int ci = 0;ci<numCommunities;ci++){
+                for(int ti = 0;ti<numTopics;ti++){
+                    communityTopicCounts[ci][ti] = 0;
+                }
+            }
 
-			TopicAssignment document = data.get(doc);
-
-            FeatureSequence tokens = (FeatureSequence) document.instance.getData();
-            FeatureSequence topicSequence =  (FeatureSequence) document.topicSequence;
-
+        for (int doc = startDoc;doc < data.size() && doc < startDoc + numDocs;doc++) {
+            Document document = (Document) data.get(doc).getData();
+            FeatureSequence tokens = (FeatureSequence) document.getText();
+            FeatureSequence topicSequence =  (FeatureSequence) document.getTopicSequence();
+            int docCommunity = document.getSenderCommunity();
+            
             int[] topics = topicSequence.getFeatures();
             for (int position = 0; position < tokens.size(); position++) {
+                int topic = topics[position];
 
-				int topic = topics[position];
+                if (topic == ParallelSNLDA.UNASSIGNED_TOPIC) { continue; }
 
-				if (topic == ParallelSNLDA.UNASSIGNED_TOPIC) { continue; }
+                tokensPerTopic[topic]++;
+                
+                // Modify the community Topic Counts (Partitioned for the current thread 
+                communityTopicCounts[docCommunity][topic]++;
 
-				tokensPerTopic[topic]++;
-				
-				// The format for these arrays is 
-				//  the topic in the rightmost bits
-				//  the count in the remaining (left) bits.
-				// Since the count is in the high bits, sorting (desc)
-				//  by the numeric value of the int guarantees that
-				//  higher counts will be before the lower counts.
-				
-				int type = tokens.getIndexAtPosition(position);
+                // The format for these arrays is 
+                //  the topic in the rightmost bits
+                //  the count in the remaining (left) bits.
+                // Since the count is in the high bits, sorting (desc)
+                //  by the numeric value of the int guarantees that
+                //  higher counts will be before the lower counts.
 
-				int[] currentTypeTopicCounts = typeTopicCounts[ type ];
-				
-				// Start by assuming that the array is either empty
-				//  or is in sorted (descending) order.
-				
-				// Here we are only adding counts, so if we find 
-				//  an existing location with the topic, we only need
-				//  to ensure that it is not larger than its left neighbor.
-				
-				int index = 0;
-				int currentTopic = currentTypeTopicCounts[index] & topicMask;
-				int currentValue;
-				
-				while (currentTypeTopicCounts[index] > 0 && currentTopic != topic) {
-					index++;
-					if (index == currentTypeTopicCounts.length) {
-						System.out.println("overflow on type " + type);
-					}
-					currentTopic = currentTypeTopicCounts[index] & topicMask;
-				}
-				currentValue = currentTypeTopicCounts[index] >> topicBits;
-				
-				if (currentValue == 0) {
-					// new value is 1, so we don't have to worry about sorting
-					//  (except by topic suffix, which doesn't matter)
-					
-					currentTypeTopicCounts[index] =
-						(1 << topicBits) + topic;
-				}
-				else {
-					currentTypeTopicCounts[index] =
-						((currentValue + 1) << topicBits) + topic;
-					
-					// Now ensure that the array is still sorted by 
-					//  bubbling this value up.
-					while (index > 0 &&
-						   currentTypeTopicCounts[index] > currentTypeTopicCounts[index - 1]) {
-						int temp = currentTypeTopicCounts[index];
-						currentTypeTopicCounts[index] = currentTypeTopicCounts[index - 1];
-						currentTypeTopicCounts[index - 1] = temp;
-						
-						index--;
-					}
-				}
-			}
-		}
+                int type = tokens.getIndexAtPosition(position);
+
+                int[] currentTypeTopicCounts = typeTopicCounts[ type ];
+
+                // Start by assuming that the array is either empty
+                //  or is in sorted (descending) order.
+
+                // Here we are only adding counts, so if we find 
+                //  an existing location with the topic, we only need
+                //  to ensure that it is not larger than its left neighbor.
+
+                int index = 0;
+                int currentTopic = currentTypeTopicCounts[index] & topicMask;
+                int currentValue;
+
+                while (currentTypeTopicCounts[index] > 0 && currentTopic != topic) {
+                        index++;
+                        if (index == currentTypeTopicCounts.length) {
+                                System.out.println("overflow on type " + type);
+                        }
+                        currentTopic = currentTypeTopicCounts[index] & topicMask;
+                }
+                currentValue = currentTypeTopicCounts[index] >> topicBits;
+
+                if (currentValue == 0) {
+                        // new value is 1, so we don't have to worry about sorting
+                        //  (except by topic suffix, which doesn't matter)
+
+                        currentTypeTopicCounts[index] =
+                                (1 << topicBits) + topic;
+                }
+                else {
+                        currentTypeTopicCounts[index] =
+                                ((currentValue + 1) << topicBits) + topic;
+
+                        // Now ensure that the array is still sorted by 
+                        //  bubbling this value up.
+                        while (index > 0 &&
+                                   currentTypeTopicCounts[index] > currentTypeTopicCounts[index - 1]) {
+                                int temp = currentTypeTopicCounts[index];
+                                currentTypeTopicCounts[index] = currentTypeTopicCounts[index - 1];
+                                currentTypeTopicCounts[index - 1] = temp;
+
+                                index--;
+                        }
+                }
+        }
+            }
 
 	}
 

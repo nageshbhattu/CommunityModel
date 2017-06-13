@@ -22,9 +22,10 @@ public class Document implements Serializable, AlphabetCarrying {
     int sender;
     int senderCommunity;
     int[] recievers;
-    int[] recieverCommunites;
+    int[] recieverCommunities;
     Alphabet userAlphabet;
     Alphabet dataAlphabet;
+    int[][] communityTopicCounts;
     
     Document(Alphabet dict){
         dataAlphabet = dict;
@@ -60,5 +61,17 @@ public class Document implements Serializable, AlphabetCarrying {
     }
     public FeatureSequence getTopicSequence(){
         return topicSequence;
+    }
+    public int getSender(){
+        return sender;
+    }
+    public int getSenderCommunity(){
+        return senderCommunity;
+    }
+    public int[] getRecievers(){
+        return recievers;
+    }
+    public int[] getRecipientCommunities(){
+        return recieverCommunities;
     }
 }
